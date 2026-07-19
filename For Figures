@@ -1,0 +1,610 @@
+# ==============================================================================
+# manuscript and supplementary figures from  output tables
+# UAV sorghum stay-green phenomics analysis
+# ==============================================================================
+
+rm(list = ls())
+
+required_pkgs <- c("dplyr", "readr", "tidyr", "ggplot2", "ggrepel")
+missing_pkgs <- required_pkgs[!required_pkgs %in% rownames(installed.packages())]
+if (length(missing_pkgs) > 0) {
+  stop("Please install missing packages first: ", paste(missing_pkgs, collapse = ", "))
+}
+
+library(dplyr)
+library(readr)
+library(tidyr)
+library(ggplot2)
+library(ggrepel)
+
+dir.create("figures", showWarnings = FALSE)
+
+# ------------------------------------------------------------------------------
+# Helper functions
+# ------------------------------------------------------------------------------
+
+find_file <- function(filenames, required = TRUE) {
+  filenames <- unique(filenames)
+
+  # Also check common accidental double-extension names, e.g., file.csv.csv
+  extra_names <- unique(c(
+    filenames,
+    ifelse(grepl("\\.csv$", filenames), paste0(filenames, ".csv"), filenames)
+  ))
+
+  candidates <- unlist(lapply(extra_names, function(filename) {
+    c(
+      file.path("outputs", filename),
+      file.path("data", filename),
+      filename
+    )
+  }))
+
+  hit <- candidates[file.exists(candidates)]
+
+  if (length(hit) == 0) {
+    if (required) {
+      stop(
+        "Missing file: ", paste(filenames, collapse = " or "),
+        ". Put it in ./outputs, ./data, or the working directory. Current working directory: ",
+        getwd()
+      )
+    }
+    return(NA_character_)
+  }
+
+  hit[1]
+}
+
+read_out <- function(filename, required = TRUE) {
+  hit <- find_file(filename, required = required)
+  if (is.na(hit)) return(NULL)
+  read_csv(hit, show_col_types = FALSE)
+}
+
+safe_cor <- function(x, y, method = "spearman") {
+  ok <- complete.cases(x, y)
+  if (sum(ok) < 3) return(NA_real_)
+  suppressWarnings(cor(x[ok], y[ok], method = method))
+}
+
+save_png_pdf <- function(plot_object, base_filename, width, height, dpi = 600) {
+  ggsave(
+    file.path("figures", paste0(base_filename, ".png")),
+    plot = plot_object,
+    width = width,
+    height = height,
+    dpi = dpi
+  )
+
+  ggsave(
+    file.path("figures", paste0(base_filename, ".pdf")),
+    plot = plot_object,
+    width = width,
+    height = height
+  )
+}
+
+# ------------------------------------------------------------------------------
+# Read required and optional output tables
+# ------------------------------------------------------------------------------
+
+master_blups <- read_out("03A_Phase3_Master_BLUPs.csv")
+env_ranks <- read_out("04A_Phase4_Environment_Ranks.csv")
+sti_ranks <- read_out("04B_Phase4_STI_Ranks.csv")
+sgsi <- read_out("04C_Phase4_Final_Selection_Index_702010.csv")
+visual_cor <- read_out("05A_UAV_vs_Visual_Correlations.csv", required = FALSE)
+pca_scores <- read_out("06A_PCA_Scores_All_Genotypes_702010.csv")
+diverse_panel <- read_out("06C_Final_Diverse_Top10_Panel.csv")
+pca_var <- read_out("06D_PCA_Variance_Explained_702010.csv", required = FALSE)
+mvp <- read_out(c("07B_MVP_ABE_Dry_Comparison_Output.csv", "07_MVP_Comparison_ABE_Dry.csv"), required = FALSE)
+
+# ------------------------------------------------------------------------------
+# Figure 1: BLUP distributions for four core UAV stay-green traits
+# ------------------------------------------------------------------------------
+
+plot_data_long <- master_blups %>%
+  filter(Treatment == "Dry") %>%
+  select(Environment, Genotype, NDVI_AUC_Post, NDRE_AUC_Post, NDVI_Final, NDRE_Final) %>%
+  pivot_longer(
+    cols = c(NDVI_AUC_Post, NDRE_AUC_Post, NDVI_Final, NDRE_Final),
+    names_to = "Trait",
+    values_to = "Value"
+  ) %>%
+  drop_na()
+
+plot_data_long$Trait <- factor(
+  plot_data_long$Trait,
+  levels = c("NDVI_AUC_Post", "NDRE_AUC_Post", "NDVI_Final", "NDRE_Final"),
+  labels = c("NDVI AUC", "NDRE AUC", "Final NDVI", "Final NDRE")
+)
+
+plot_data_long$Environment <- factor(
+  plot_data_long$Environment,
+  levels = c("BUSH", "ABE", "LBK")
+)
+
+fig_blup_dist <- ggplot(plot_data_long, aes(x = Environment, y = Value, fill = Environment)) +
+  geom_violin(alpha = 0.5, color = "black") +
+  geom_boxplot(width = 0.2, fill = "white", outlier.shape = 21) +
+  facet_wrap(~ Trait, scales = "free_y", ncol = 2) +
+  theme_bw(base_size = 14) +
+  labs(x = NULL, y = "Spatially corrected BLUP") +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(face = "bold")
+  )
+
+save_png_pdf(fig_blup_dist, "Figure_BLUP_Distributions", width = 8, height = 8)
+
+# ------------------------------------------------------------------------------
+# Figure 2: cross-environment rank correlation heatmap
+# ------------------------------------------------------------------------------
+
+rank_cols <- c("CoreRank_ABE", "CoreRank_BUSH", "CoreRank_LBK")
+missing_rank_cols <- setdiff(rank_cols, names(sgsi))
+if (length(missing_rank_cols) > 0) {
+  message("Skipping rank correlation heatmap because missing columns: ", paste(missing_rank_cols, collapse = ", "))
+} else {
+  cor_matrix <- cor(
+    sgsi %>% select(all_of(rank_cols)),
+    use = "pairwise.complete.obs",
+    method = "spearman"
+  )
+
+  cor_long <- as.data.frame(cor_matrix) %>%
+    mutate(Env1 = rownames(.)) %>%
+    pivot_longer(-Env1, names_to = "Env2", values_to = "Correlation") %>%
+    mutate(
+      Env1 = gsub("CoreRank_", "", Env1),
+      Env2 = gsub("CoreRank_", "", Env2),
+      Env1 = factor(Env1, levels = c("ABE", "BUSH", "LBK")),
+      Env2 = factor(Env2, levels = c("ABE", "BUSH", "LBK"))
+    )
+
+  fig_rank_cor <- ggplot(cor_long, aes(x = Env1, y = Env2, fill = Correlation)) +
+    geom_tile(color = "white", linewidth = 1) +
+    geom_text(aes(label = sprintf("%.2f", Correlation)), size = 6, fontface = "bold") +
+    scale_fill_gradient2(
+      low = "grey80",
+      mid = "white",
+      high = "grey20",
+      midpoint = 0,
+      limits = c(-1, 1),
+      name = NULL
+    ) +
+    theme_minimal(base_size = 14) +
+    labs(x = NULL, y = NULL) +
+    theme(
+      axis.text = element_text(face = "bold"),
+      panel.grid = element_blank()
+    )
+
+  save_png_pdf(fig_rank_cor, "Figure_Rank_Correlation_Heatmap", width = 6, height = 5)
+}
+
+# ------------------------------------------------------------------------------
+# Figure 3: SGSI stability plot with pure top 10, diversity panel, and overlap
+# ------------------------------------------------------------------------------
+
+plot_data <- sgsi %>%
+  mutate(
+    In_Diversity_Panel = Genotype %in% diverse_panel$Genotype,
+    In_Pure_Top10 = Pure_StayGreen_Top10,
+    Plot_Group = case_when(
+      In_Diversity_Panel & In_Pure_Top10 ~ "Overlap: pure top 10 + diversity panel",
+      In_Diversity_Panel & !In_Pure_Top10 ~ "Diversity-aware panel only",
+      !In_Diversity_Panel & In_Pure_Top10 ~ "Pure stay-green top 10 only",
+      TRUE ~ "Field population"
+    ),
+    Label = ifelse(Plot_Group != "Field population", Pedigree, "")
+  )
+
+fig_stability <- ggplot(plot_data, aes(x = Mean_Rank, y = Rank_SD)) +
+  geom_vline(
+    xintercept = median(plot_data$Mean_Rank, na.rm = TRUE),
+    linetype = "dashed",
+    color = "gray50"
+  ) +
+  geom_hline(
+    yintercept = median(plot_data$Rank_SD, na.rm = TRUE),
+    linetype = "dashed",
+    color = "gray50"
+  ) +
+  geom_point(
+    data = filter(plot_data, Plot_Group == "Field population"),
+    color = "gray75",
+    size = 2.4,
+    alpha = 0.55
+  ) +
+  geom_point(
+    data = filter(plot_data, Plot_Group == "Pure stay-green top 10 only"),
+    shape = 24,
+    fill = "white",
+    color = "black",
+    size = 4.5
+  ) +
+  geom_point(
+    data = filter(plot_data, Plot_Group == "Diversity-aware panel only"),
+    shape = 21,
+    fill = "white",
+    color = "black",
+    size = 4.5
+  ) +
+  geom_point(
+    data = filter(plot_data, Plot_Group == "Overlap: pure top 10 + diversity panel"),
+    shape = 23,
+    fill = "gray35",
+    color = "black",
+    size = 5.0
+  ) +
+  geom_text_repel(
+    data = filter(plot_data, Plot_Group != "Field population"),
+    aes(label = Label),
+    size = 3.6,
+    fontface = "bold",
+    max.overlaps = Inf
+  ) +
+  scale_x_reverse(name = "Mean stay-green rank") +
+  scale_y_reverse(name = "Rank SD") +
+  theme_bw(base_size = 14) +
+  theme(panel.grid.minor = element_blank())
+
+save_png_pdf(fig_stability, "Figure_SGSI_Stability_Pure_Diverse_Overlap", width = 8.5, height = 6.5)
+
+# ------------------------------------------------------------------------------
+# Figure 4: PCA diversity plot
+# ------------------------------------------------------------------------------
+
+pca_plot <- pca_scores %>%
+  mutate(
+    In_Diversity_Panel = Genotype %in% diverse_panel$Genotype,
+    Label = ifelse(In_Diversity_Panel, Pedigree, "")
+  )
+
+pc1_label <- "PC1"
+pc2_label <- "PC2"
+
+if (!is.null(pca_var)) {
+  pc1_val <- pca_var$Variance_Explained_Percent[pca_var$PC == "PC1"]
+  pc2_val <- pca_var$Variance_Explained_Percent[pca_var$PC == "PC2"]
+
+  if (length(pc1_val) == 1 && length(pc2_val) == 1) {
+    pc1_label <- paste0("PC1 (", pc1_val, "%)")
+    pc2_label <- paste0("PC2 (", pc2_val, "%)")
+  }
+}
+
+fig_pca <- ggplot(pca_plot, aes(x = PC1, y = PC2)) +
+  geom_point(
+    data = filter(pca_plot, !In_Diversity_Panel),
+    color = "gray75",
+    size = 2.5,
+    alpha = 0.6
+  ) +
+  geom_point(
+    data = filter(pca_plot, In_Diversity_Panel),
+    shape = 21,
+    fill = "white",
+    color = "black",
+    size = 5
+  ) +
+  geom_text_repel(
+    data = filter(pca_plot, In_Diversity_Panel),
+    aes(label = Label),
+    size = 4,
+    fontface = "bold",
+    max.overlaps = Inf
+  ) +
+  theme_classic(base_size = 14) +
+  labs(x = pc1_label, y = pc2_label)
+
+save_png_pdf(fig_pca, "Figure_PCA_Diversity", width = 8, height = 6)
+
+# ------------------------------------------------------------------------------
+# Figure 5: UAV-derived stay-green traits vs visual stay-green correlation heatmap
+# ------------------------------------------------------------------------------
+
+if (!is.null(visual_cor)) {
+  if ("spearman_rho" %in% names(visual_cor)) {
+    visual_cor <- visual_cor %>% rename(Spearman_rho = spearman_rho)
+  }
+
+  visual_cor$UAV_Trait <- factor(
+    visual_cor$UAV_Trait,
+    levels = c("NDVI_AUC_Post", "NDRE_AUC_Post", "NDVI_Final", "NDRE_Final"),
+    labels = c("NDVI AUC", "NDRE AUC", "Final NDVI", "Final NDRE")
+  )
+
+  visual_cor$Environment <- factor(
+    visual_cor$Environment,
+    levels = c("ABE", "BUSH", "LBK")
+  )
+
+  fig_visual <- ggplot(visual_cor, aes(x = UAV_Trait, y = Environment, fill = Spearman_rho)) +
+    geom_tile(color = "white", linewidth = 1) +
+    geom_text(aes(label = sprintf("%.2f", Spearman_rho)), size = 5, fontface = "bold") +
+    scale_fill_gradient2(
+      low = "grey80",
+      mid = "white",
+      high = "grey20",
+      midpoint = 0,
+      limits = c(-1, 1),
+      name = NULL
+    ) +
+    theme_bw(base_size = 14) +
+    labs(x = "UAV-derived SG trait", y = "Environment") +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+      axis.text.y = element_text(face = "bold")
+    )
+
+  save_png_pdf(fig_visual, "Figure_UAV_Visual_Correlation_Heatmap", width = 7, height = 5)
+} else {
+  message("Skipping UAV vs visual correlation heatmap because 05A_UAV_vs_Visual_Correlations.csv was not found.")
+}
+
+# ------------------------------------------------------------------------------
+# Figure 6: drought performance rank vs stress tolerance index rank
+# ------------------------------------------------------------------------------
+
+required_sti_cols <- c("Genotype", "Mean_STI_Rank")
+missing_sti_cols <- setdiff(required_sti_cols, names(sti_ranks))
+
+if (length(missing_sti_cols) > 0) {
+  message("Skipping STI figure because missing columns in 04B file: ", paste(missing_sti_cols, collapse = ", "))
+} else {
+  sti_plot_data <- sgsi %>%
+    select(
+      Genotype,
+      Pedigree,
+      Mean_Rank,
+      Ultimate_Rank_702010,
+      Ultimate_Rank_702010_All
+    ) %>%
+    inner_join(
+      sti_ranks %>%
+        select(Genotype, Mean_STI_Rank, any_of("Ultimate_STI_Rank")),
+      by = "Genotype"
+    ) %>%
+    mutate(
+      In_Diversity_Panel = Genotype %in% diverse_panel$Genotype,
+      Label = ifelse(In_Diversity_Panel, Pedigree, "")
+    )
+
+  fig_sti <- ggplot(sti_plot_data, aes(x = Mean_Rank, y = Mean_STI_Rank)) +
+    geom_smooth(method = "lm", color = "black", linetype = "dashed", se = FALSE) +
+    geom_point(
+      data = filter(sti_plot_data, !In_Diversity_Panel),
+      color = "gray75",
+      size = 2.5,
+      alpha = 0.6
+    ) +
+    geom_point(
+      data = filter(sti_plot_data, In_Diversity_Panel),
+      shape = 21,
+      fill = "white",
+      color = "black",
+      size = 5
+    ) +
+    geom_text_repel(
+      data = filter(sti_plot_data, In_Diversity_Panel),
+      aes(label = Label),
+      size = 3.6,
+      fontface = "bold",
+      max.overlaps = Inf
+    ) +
+    scale_x_reverse(name = "Mean drought stay-green performance rank") +
+    scale_y_reverse(name = "Mean stress tolerance index rank") +
+    theme_bw(base_size = 14) +
+    theme(panel.grid.minor = element_blank())
+
+  save_png_pdf(fig_sti, "Figure_Drought_Performance_vs_STI_Rank", width = 8, height = 6)
+}
+
+# ------------------------------------------------------------------------------
+# Figure 7: MVP comparison
+# ------------------------------------------------------------------------------
+
+if (!is.null(mvp)) {
+  required_mvp_cols <- c("Rank_Full_Flight", "Rank_2_Flight")
+  missing_mvp_cols <- setdiff(required_mvp_cols, names(mvp))
+
+  if (length(missing_mvp_cols) > 0) {
+    message("Skipping MVP figure because missing columns: ", paste(missing_mvp_cols, collapse = ", "))
+  } else {
+    rho_mvp <- safe_cor(mvp$Rank_Full_Flight, mvp$Rank_2_Flight, method = "spearman")
+
+    fig_mvp <- ggplot(mvp, aes(x = Rank_Full_Flight, y = Rank_2_Flight)) +
+      geom_point(alpha = 0.6, size = 3) +
+      geom_smooth(method = "lm", color = "black", linetype = "dashed", se = FALSE) +
+      annotate(
+        "text",
+        x = min(mvp$Rank_Full_Flight, na.rm = TRUE),
+        y = max(mvp$Rank_2_Flight, na.rm = TRUE),
+        label = sprintf("Spearman rho = %.2f", rho_mvp),
+        hjust = 0,
+        fontface = "bold",
+        size = 5
+      ) +
+      scale_x_reverse(name = "Rank: full-flight UAV model") +
+      scale_y_reverse(name = "Rank: two-flight UAV model") +
+      theme_bw(base_size = 14)
+
+    save_png_pdf(fig_mvp, "Figure_MVP_Comparison", width = 7, height = 6)
+  }
+} else {
+  message("Skipping MVP figure because 07B_MVP_ABE_Dry_Comparison_Output.csv was not found.")
+}
+
+# ------------------------------------------------------------------------------
+# Supplementary Figure S1: raw vegetation indices vs manual stay-green correlation
+# ------------------------------------------------------------------------------
+
+raw_vi_cor <- read_out(
+  c(
+    "05C_Raw_Manual_vs_Raw_VI_Correlation.csv",
+    "08_Raw_Manual_vs_Raw_VI_Correlation.csv"
+  ),
+  required = FALSE
+)
+
+if (!is.null(raw_vi_cor)) {
+  if ("spearman_rho" %in% names(raw_vi_cor)) {
+    raw_vi_cor <- raw_vi_cor %>% rename(Spearman_rho = spearman_rho)
+  }
+  if ("rho" %in% names(raw_vi_cor)) {
+    raw_vi_cor <- raw_vi_cor %>% rename(Spearman_rho = rho)
+  }
+  if ("Vegetation_Index" %in% names(raw_vi_cor)) {
+    raw_vi_cor <- raw_vi_cor %>% rename(VI = Vegetation_Index)
+  }
+  if ("Index" %in% names(raw_vi_cor) && !"VI" %in% names(raw_vi_cor)) {
+    raw_vi_cor <- raw_vi_cor %>% rename(VI = Index)
+  }
+
+  required_s1_cols <- c("Environment", "VI", "Spearman_rho")
+  missing_s1_cols <- setdiff(required_s1_cols, names(raw_vi_cor))
+
+  if (length(missing_s1_cols) > 0) {
+    message("Skipping Supplementary Figure S1 because missing columns: ", paste(missing_s1_cols, collapse = ", "))
+  } else {
+    vi_order_s1 <- c(
+      "CIG", "CIRE", "EVI2", "GNDVI", "MSR",
+      "NDRE", "NDVI", "OSAVI", "SAVI", "SR"
+    )
+
+    raw_vi_cor <- raw_vi_cor %>%
+      mutate(
+        VI = factor(VI, levels = vi_order_s1),
+        Environment = factor(Environment, levels = c("ABE", "BUSH", "LBK"))
+      )
+
+    fig_supp_s1 <- ggplot(raw_vi_cor, aes(x = VI, y = Environment, fill = Spearman_rho)) +
+      geom_tile(color = "white", linewidth = 0.7) +
+      geom_text(aes(label = round(Spearman_rho, 2)), size = 4, fontface = "bold") +
+      scale_fill_gradient2(
+        low = "#D55E00",
+        mid = "white",
+        high = "#0072B2",
+        midpoint = 0,
+        limits = c(-1, 1),
+        name = NULL
+      ) +
+      theme_bw(base_size = 14) +
+      labs(
+        x = "Vegetation index",
+        y = "Environment"
+      ) +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+        axis.text.y = element_text(face = "bold"),
+        axis.title.x = element_text(face = "bold"),
+        axis.title.y = element_text(face = "bold"),
+        legend.title = element_blank(),
+        panel.grid = element_blank()
+      )
+
+    save_png_pdf(fig_supp_s1, "Supplementary_Figure_S1_Raw_Manual_vs_Raw_VI_Heatmap", width = 9, height = 5)
+  }
+} else {
+  message("Skipping Supplementary Figure S1 because 05C_Raw_Manual_vs_Raw_VI_Correlation.csv was not found.")
+}
+
+# ------------------------------------------------------------------------------
+# Supplementary Figure S2: raw vegetation-index redundancy heatmap
+# ------------------------------------------------------------------------------
+
+vi_red_long <- read_out("05D_Raw_VI_Redundancy_Correlation_Long.csv", required = FALSE)
+
+if (is.null(vi_red_long)) {
+  vi_red_matrix <- read_out(
+    c(
+      "05D_Raw_VI_Redundancy_Correlation_Matrix.csv",
+      "Phase2B_Intra_Index_Redundancy.csv"
+    ),
+    required = FALSE
+  )
+
+  if (!is.null(vi_red_matrix)) {
+    # If first column is not named VI, make it VI.
+    if (!"VI" %in% names(vi_red_matrix)) {
+      names(vi_red_matrix)[1] <- "VI"
+    }
+
+    vi_red_long <- vi_red_matrix %>%
+      pivot_longer(
+        cols = -VI,
+        names_to = "VI2",
+        values_to = "Spearman_rho"
+      ) %>%
+      rename(VI1 = VI)
+
+    write_csv(
+      vi_red_long,
+      file.path("outputs", "05D_Raw_VI_Redundancy_Correlation_Long.csv")
+    )
+  }
+}
+
+if (!is.null(vi_red_long)) {
+  if ("spearman_rho" %in% names(vi_red_long)) {
+    vi_red_long <- vi_red_long %>% rename(Spearman_rho = spearman_rho)
+  }
+  if ("rho" %in% names(vi_red_long)) {
+    vi_red_long <- vi_red_long %>% rename(Spearman_rho = rho)
+  }
+  if ("VI" %in% names(vi_red_long) && !"VI1" %in% names(vi_red_long)) {
+    vi_red_long <- vi_red_long %>% rename(VI1 = VI)
+  }
+  if ("Index1" %in% names(vi_red_long) && !"VI1" %in% names(vi_red_long)) {
+    vi_red_long <- vi_red_long %>% rename(VI1 = Index1)
+  }
+  if ("Index2" %in% names(vi_red_long) && !"VI2" %in% names(vi_red_long)) {
+    vi_red_long <- vi_red_long %>% rename(VI2 = Index2)
+  }
+
+  required_s2_cols <- c("VI1", "VI2", "Spearman_rho")
+  missing_s2_cols <- setdiff(required_s2_cols, names(vi_red_long))
+
+  if (length(missing_s2_cols) > 0) {
+    message("Skipping Supplementary Figure S2 because missing columns: ", paste(missing_s2_cols, collapse = ", "))
+  } else {
+    vi_order_s2 <- c(
+      "NDVI", "NDRE", "GNDVI", "SAVI", "OSAVI",
+      "CIG", "CIRE", "SR", "MSR", "EVI2"
+    )
+
+    vi_red_long <- vi_red_long %>%
+      mutate(
+        VI1 = factor(VI1, levels = vi_order_s2),
+        VI2 = factor(VI2, levels = rev(vi_order_s2))
+      )
+
+    fig_supp_s2 <- ggplot(vi_red_long, aes(x = VI1, y = VI2, fill = Spearman_rho)) +
+      geom_tile(color = "white", linewidth = 0.7) +
+      geom_text(aes(label = round(Spearman_rho, 2)), size = 3.5, fontface = "bold") +
+      scale_fill_gradient2(
+        low = "#D55E00",
+        mid = "white",
+        high = "#0072B2",
+        midpoint = 0,
+        limits = c(-1, 1),
+        name = NULL
+      ) +
+      theme_bw(base_size = 13) +
+      labs(x = NULL, y = NULL) +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+        axis.text.y = element_text(face = "bold"),
+        legend.title = element_blank(),
+        panel.grid = element_blank()
+      )
+
+    save_png_pdf(fig_supp_s2, "Supplementary_Figure_S2_Raw_VI_Redundancy_Heatmap", width = 8, height = 7)
+  }
+} else {
+  message("Skipping Supplementary Figure S2 because 05D_Raw_VI_Redundancy_Correlation_Matrix.csv was not found.")
+}
+
+cat("Done: manuscript and supplementary figures saved in ./figures\n")
