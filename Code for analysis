@@ -1,0 +1,716 @@
+# ==============================================================================
+# Reproduce manuscript analysis
+# UAV sorghum stay-green phenomics 
+# ============================================================================== 
+
+rm(list = ls())
+
+required_pkgs <- c("dplyr", "readr", "tidyr", "cluster", "SpATS")
+missing_pkgs <- required_pkgs[!required_pkgs %in% rownames(installed.packages())]
+if (length(missing_pkgs) > 0) {
+  stop("Please install missing packages first: ", paste(missing_pkgs, collapse = ", "))
+}
+
+library(dplyr)
+library(readr)
+library(tidyr)
+library(cluster)
+library(SpATS)
+
+dir.create("outputs", showWarnings = FALSE)
+
+
+find_file <- function(filename) {
+  candidates <- c(
+    file.path("data", filename),
+    file.path("outputs", filename),
+    filename
+  )
+  hit <- candidates[file.exists(candidates)]
+  if (length(hit) == 0) {
+    stop(
+      "Cannot find ", filename, ". Put it in ./data, ./outputs, or the working directory. Current working directory: ",
+      getwd()
+    )
+  }
+  hit[1]
+}
+
+safe_spearman <- function(x, y) {
+  ok <- complete.cases(x, y)
+  if (sum(ok) < 3) return(NA_real_)
+  suppressWarnings(cor(x[ok], y[ok], method = "spearman"))
+}
+
+# Standardized post-flowering AUC: trapezoidal AUC divided by the
+# observed post-flowering GDD width.
+calc_post_flowering_auc <- function(gdd_after_flowering, y) {
+  valid <- !is.na(gdd_after_flowering) & !is.na(y) & gdd_after_flowering >= 0
+  if (sum(valid) < 2) return(NA_real_)
+
+  x_val <- gdd_after_flowering[valid]
+  y_val <- y[valid]
+  ord <- order(x_val)
+  x_ord <- x_val[ord]
+  y_ord <- y_val[ord]
+
+  abs_auc <- sum(diff(x_ord) * (y_ord[-1] + y_ord[-length(y_ord)]) / 2)
+  width <- max(x_ord) - min(x_ord)
+  if (width <= 0) return(NA_real_)
+
+  abs_auc / width
+}
+
+# ------------------------------------------------------------------------------
+# Input: raw traits
+# ------------------------------------------------------------------------------
+raw_traits <- read_csv(find_file("02_Phase2_Extracted_Traits.csv"), show_col_types = FALSE)
+
+# Required columns check
+required_cols <- c(
+  "Environment", "Treatment", "Plot", "Genotype", "Pedigree", "Block", "Row", "Column",
+  "is_check", "GDD_to_Flowering", "Day_to_Flowering", "Lodging",
+  "NDVI_AUC_Post", "NDRE_AUC_Post", "NDVI_Final", "NDRE_Final"
+)
+missing_cols <- setdiff(required_cols, names(raw_traits))
+if (length(missing_cols) > 0) {
+  stop("Phase 2 file is missing required columns: ", paste(missing_cols, collapse = ", "))
+}
+
+# ------------------------------------------------------------------------------
+# SpATS function for UAV/visual traits
+# ------------------------------------------------------------------------------
+run_spats_and_stats <- function(data, trait_name) {
+  df_fit <- data %>%
+    filter(is.finite(.data[[trait_name]]), !is.na(Genotype), !is.na(GDD_to_Flowering)) %>%
+    mutate(
+      geno = as.factor(Genotype),
+      RowID = as.numeric(as.factor(Row)),
+      ColID = as.numeric(as.factor(Column)),
+      BlockID = as.factor(Block),
+      CheckType = factor(
+        case_when(
+          is_check == "primary" ~ "Primary",
+          is_check == "secondary" ~ "Secondary",
+          TRUE ~ "Entry"
+        ),
+        levels = c("Entry", "Primary", "Secondary")
+      ),
+      GDD_Covariate = as.numeric(scale(GDD_to_Flowering))
+    )
+
+  if (nrow(df_fit) < 20) return(list(blups = NULL, stats = NULL))
+
+  raw_mean <- mean(df_fit[[trait_name]], na.rm = TRUE)
+  raw_sd <- sd(df_fit[[trait_name]], na.rm = TRUE)
+
+  basic_stats <- data.frame(
+    Trait = trait_name,
+    N_Plots = nrow(df_fit),
+    Mean = raw_mean,
+    Median = median(df_fit[[trait_name]], na.rm = TRUE),
+    Min = min(df_fit[[trait_name]], na.rm = TRUE),
+    Max = max(df_fit[[trait_name]], na.rm = TRUE),
+    CV_Percent = abs((raw_sd / raw_mean) * 100)
+  )
+
+  nseg_r <- max(2, min(4, length(unique(df_fit$RowID)) - 1))
+  nseg_c <- max(2, min(4, length(unique(df_fit$ColID)) - 1))
+  has_blocks <- sum(!is.na(df_fit$BlockID)) > 0 && length(unique(na.omit(df_fit$BlockID))) > 1
+
+  fit <- tryCatch({
+    if (has_blocks) {
+      SpATS(
+        response = trait_name,
+        spatial = ~ PSANOVA(RowID, ColID, nseg = c(nseg_r, nseg_c)),
+        genotype = "geno",
+        genotype.as.random = TRUE,
+        fixed = ~ GDD_Covariate + CheckType,
+        random = ~ BlockID,
+        data = df_fit,
+        control = list(tolerance = 1e-06, monitoring = 0)
+      )
+    } else {
+      SpATS(
+        response = trait_name,
+        spatial = ~ PSANOVA(RowID, ColID, nseg = c(nseg_r, nseg_c)),
+        genotype = "geno",
+        genotype.as.random = TRUE,
+        fixed = ~ GDD_Covariate + CheckType,
+        data = df_fit,
+        control = list(tolerance = 1e-06, monitoring = 0)
+      )
+    }
+  }, error = function(e) NULL)
+
+  if (is.null(fit)) {
+    pred <- df_fit %>%
+      group_by(geno) %>%
+      summarise(!!trait_name := mean(.data[[trait_name]], na.rm = TRUE), .groups = "drop")
+    basic_stats$Repeatability <- NA_real_
+    return(list(blups = pred, stats = basic_stats))
+  }
+
+  pred <- as.data.frame(predict(fit, which = "geno")) %>%
+    distinct(geno, .keep_all = TRUE) %>%
+    select(geno, predicted.values) %>%
+    rename(!!trait_name := predicted.values)
+
+  basic_stats$Repeatability <- tryCatch(getHeritability(fit), error = function(e) NA_real_)
+  list(blups = pred, stats = basic_stats)
+}
+
+# Core traits used in manuscript SGSI analysis
+core_traits <- c("NDVI_AUC_Post", "NDRE_AUC_Post", "NDVI_Final", "NDRE_Final")
+
+# Supporting visual traits if available
+support_traits <- c("Manual_AUC", "Manual_Final")
+support_traits <- support_traits[support_traits %in% names(raw_traits)]
+
+target_traits <- c(core_traits, support_traits)
+
+trials <- raw_traits %>% distinct(Environment, Treatment)
+final_blups_list <- list()
+final_stats_list <- list()
+
+for (i in seq_len(nrow(trials))) {
+  env <- trials$Environment[i]
+  trt <- trials$Treatment[i]
+  trial_data <- raw_traits %>% filter(Environment == env, Treatment == trt)
+
+  trial_blups <- data.frame(geno = unique(trial_data$Genotype[!is.na(trial_data$Genotype)]))
+
+  for (trait in target_traits) {
+    res <- run_spats_and_stats(trial_data, trait)
+    if (!is.null(res$blups)) trial_blups <- trial_blups %>% left_join(res$blups, by = "geno")
+    if (!is.null(res$stats)) {
+      final_stats_list[[length(final_stats_list) + 1]] <-
+        res$stats %>% mutate(Environment = env, Treatment = trt)
+    }
+  }
+
+  trial_blups <- trial_blups %>%
+    mutate(Environment = env, Treatment = trt) %>%
+    select(Environment, Treatment, geno, everything())
+
+  final_blups_list[[length(final_blups_list) + 1]] <- trial_blups
+}
+
+pedigree_map <- raw_traits %>%
+  distinct(Genotype, Pedigree) %>%
+  filter(!is.na(Genotype))
+
+entry_type_map <- raw_traits %>%
+  distinct(Genotype, is_check) %>%
+  filter(!is.na(Genotype)) %>%
+  mutate(
+    Entry_type = case_when(
+      is_check == "primary" ~ "Primary replicated check",
+      is_check == "secondary" ~ "Secondary replicated check",
+      TRUE ~ "SAP/field entry"
+    )
+  ) %>%
+  select(Genotype, Entry_type)
+
+master_blups <- bind_rows(final_blups_list) %>%
+  rename(Genotype = geno) %>%
+  distinct(Environment, Treatment, Genotype, .keep_all = TRUE) %>%
+  left_join(pedigree_map, by = "Genotype") %>%
+  left_join(entry_type_map, by = "Genotype") %>%
+  select(Environment, Treatment, Genotype, Pedigree, Entry_type, everything())
+
+# Descriptive stats for four core manuscript traits only.
+stats_table <- bind_rows(final_stats_list) %>%
+  filter(Treatment == "Dry", Trait %in% core_traits) %>%
+  select(Environment, Treatment, Trait, N_Plots, Mean, Median, Min, Max, CV_Percent, Repeatability) %>%
+  arrange(Environment, Trait)
+
+write_csv(stats_table, file.path("outputs", "03B_Phase3_Descriptive_Stats.csv"))
+
+
+run_spats_flowering <- function(data, trait_name) {
+  df_fit <- data %>%
+    filter(is.finite(.data[[trait_name]]), !is.na(Genotype)) %>%
+    mutate(
+      geno = as.factor(Genotype),
+      RowID = as.numeric(as.factor(Row)),
+      ColID = as.numeric(as.factor(Column)),
+      BlockID = as.factor(Block),
+      CheckType = factor(
+        case_when(
+          is_check == "primary" ~ "Primary",
+          is_check == "secondary" ~ "Secondary",
+          TRUE ~ "Entry"
+        ),
+        levels = c("Entry", "Primary", "Secondary")
+      )
+    )
+
+  if (nrow(df_fit) < 20) return(NULL)
+
+  nseg_r <- max(2, min(4, length(unique(df_fit$RowID)) - 1))
+  nseg_c <- max(2, min(4, length(unique(df_fit$ColID)) - 1))
+  has_blocks <- sum(!is.na(df_fit$BlockID)) > 0 && length(unique(na.omit(df_fit$BlockID))) > 1
+
+  fit <- tryCatch({
+    if (has_blocks) {
+      SpATS(
+        response = trait_name,
+        spatial = ~ PSANOVA(RowID, ColID, nseg = c(nseg_r, nseg_c)),
+        genotype = "geno",
+        genotype.as.random = TRUE,
+        fixed = ~ CheckType,
+        random = ~ BlockID,
+        data = df_fit,
+        control = list(tolerance = 1e-06, monitoring = 0)
+      )
+    } else {
+      SpATS(
+        response = trait_name,
+        spatial = ~ PSANOVA(RowID, ColID, nseg = c(nseg_r, nseg_c)),
+        genotype = "geno",
+        genotype.as.random = TRUE,
+        fixed = ~ CheckType,
+        data = df_fit,
+        control = list(tolerance = 1e-06, monitoring = 0)
+      )
+    }
+  }, error = function(e) NULL)
+
+  if (is.null(fit)) {
+    df_fit %>%
+      group_by(geno) %>%
+      summarise(predicted.values = mean(.data[[trait_name]], na.rm = TRUE), .groups = "drop")
+  } else {
+    as.data.frame(predict(fit, which = "geno")) %>%
+      distinct(geno, .keep_all = TRUE) %>%
+      select(geno, predicted.values)
+  }
+}
+
+flowering_blups_list <- list()
+for (i in seq_len(nrow(trials))) {
+  env <- trials$Environment[i]
+  trt <- trials$Treatment[i]
+  trial_data <- raw_traits %>% filter(Environment == env, Treatment == trt)
+
+  day_pred <- run_spats_flowering(trial_data, "Day_to_Flowering")
+  gdd_pred <- run_spats_flowering(trial_data, "GDD_to_Flowering")
+
+  if (!is.null(day_pred) && !is.null(gdd_pred)) {
+    trial_flowering <- day_pred %>%
+      rename(Genotype = geno, Day_to_Flowering_BLUP = predicted.values) %>%
+      left_join(
+        gdd_pred %>% rename(Genotype = geno, GDD_to_Flowering_BLUP = predicted.values),
+        by = "Genotype"
+      ) %>%
+      mutate(Environment = env, Treatment = trt) %>%
+      select(Environment, Treatment, Genotype, Day_to_Flowering_BLUP, GDD_to_Flowering_BLUP)
+
+    flowering_blups_list[[length(flowering_blups_list) + 1]] <- trial_flowering
+  }
+}
+
+flowering_blups <- bind_rows(flowering_blups_list)
+
+master_blups <- master_blups %>%
+  left_join(
+    flowering_blups,
+    by = c("Environment", "Treatment", "Genotype")
+  )
+
+write_csv(master_blups, file.path("outputs", "03A_Phase3_Master_BLUPs.csv"))
+
+flowering_summary_for_tables <- master_blups %>%
+  filter(Treatment == "Dry") %>%
+  select(Genotype, Pedigree, Environment, Day_to_Flowering_BLUP, GDD_to_Flowering_BLUP) %>%
+  pivot_wider(
+    names_from = Environment,
+    values_from = c(Day_to_Flowering_BLUP, GDD_to_Flowering_BLUP),
+    names_glue = "{Environment}_{.value}"
+  ) %>%
+  mutate(
+    Mean_Day_to_Flowering_BLUP = rowMeans(select(., ends_with("_Day_to_Flowering_BLUP")), na.rm = TRUE),
+    Mean_GDD_to_Flowering_BLUP = rowMeans(select(., ends_with("_GDD_to_Flowering_BLUP")), na.rm = TRUE)
+  )
+
+# ------------------------------------------------------------------------------
+# Phase 4: environment ranks, STI, SGSI, weight sensitivity analysis
+# ------------------------------------------------------------------------------
+dry_blups <- master_blups %>% filter(Treatment == "Dry")
+irr_blups <- master_blups %>% filter(Treatment == "Irr")
+
+env_ranks <- dry_blups %>%
+  group_by(Environment) %>%
+  mutate(
+    Rank_NDVI_AUC = rank(desc(NDVI_AUC_Post), ties.method = "min", na.last = "keep"),
+    Rank_NDRE_AUC = rank(desc(NDRE_AUC_Post), ties.method = "min", na.last = "keep"),
+    Rank_NDVI_Fin = rank(desc(NDVI_Final), ties.method = "min", na.last = "keep"),
+    Rank_NDRE_Fin = rank(desc(NDRE_Final), ties.method = "min", na.last = "keep"),
+    Avg_Core_Rank = (Rank_NDVI_AUC + Rank_NDRE_AUC + Rank_NDVI_Fin + Rank_NDRE_Fin) / 4,
+    Env_Core_Rank = rank(Avg_Core_Rank, ties.method = "min", na.last = "keep"),
+    Top_20_Pct = ifelse(Env_Core_Rank <= (n() * 0.20), 1, 0)
+  ) %>%
+  ungroup()
+
+wide_env_ranks <- env_ranks %>%
+  select(Genotype, Environment, Env_Core_Rank) %>%
+  pivot_wider(names_from = Environment, values_from = Env_Core_Rank, names_prefix = "CoreRank_")
+
+write_csv(env_ranks, file.path("outputs", "04A_Phase4_Environment_Ranks.csv"))
+
+sti_calc <- dry_blups %>%
+  filter(Environment %in% c("ABE", "BUSH")) %>%
+  select(
+    Environment, Genotype,
+    D_NDVI_A = NDVI_AUC_Post, D_NDRE_A = NDRE_AUC_Post,
+    D_NDVI_F = NDVI_Final, D_NDRE_F = NDRE_Final
+  ) %>%
+  inner_join(
+    irr_blups %>%
+      filter(Environment %in% c("ABE", "BUSH")) %>%
+      select(
+        Environment, Genotype,
+        I_NDVI_A = NDVI_AUC_Post, I_NDRE_A = NDRE_AUC_Post,
+        I_NDVI_F = NDVI_Final, I_NDRE_F = NDRE_Final
+      ),
+    by = c("Environment", "Genotype")
+  ) %>%
+  group_by(Environment) %>%
+  mutate(
+    STI_NDVI_A = (D_NDVI_A * I_NDVI_A) / (mean(I_NDVI_A, na.rm = TRUE)^2),
+    STI_NDRE_A = (D_NDRE_A * I_NDRE_A) / (mean(I_NDRE_A, na.rm = TRUE)^2),
+    STI_NDVI_F = (D_NDVI_F * I_NDVI_F) / (mean(I_NDVI_F, na.rm = TRUE)^2),
+    STI_NDRE_F = (D_NDRE_F * I_NDRE_F) / (mean(I_NDRE_F, na.rm = TRUE)^2),
+    Avg_Env_STI_Rank = rowMeans(
+      cbind(
+        rank(desc(STI_NDVI_A), ties.method = "min", na.last = "keep"),
+        rank(desc(STI_NDRE_A), ties.method = "min", na.last = "keep"),
+        rank(desc(STI_NDVI_F), ties.method = "min", na.last = "keep"),
+        rank(desc(STI_NDRE_F), ties.method = "min", na.last = "keep")
+      ),
+      na.rm = TRUE
+    ),
+    Env_STI_Rank = rank(Avg_Env_STI_Rank, ties.method = "min", na.last = "keep")
+  ) %>%
+  ungroup()
+
+final_sti_index <- sti_calc %>%
+  group_by(Genotype) %>%
+  summarise(
+    Envs_Tested_STI = sum(!is.na(Env_STI_Rank)),
+    Mean_STI_Rank = mean(Env_STI_Rank, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(Envs_Tested_STI >= 1) %>%
+  mutate(Ultimate_STI_Rank = rank(Mean_STI_Rank, ties.method = "min", na.last = "keep")) %>%
+  left_join(pedigree_map, by = "Genotype") %>%
+  left_join(entry_type_map, by = "Genotype") %>%
+  select(Pedigree, Genotype, Entry_type, Envs_Tested_STI, Mean_STI_Rank, Ultimate_STI_Rank)
+
+write_csv(final_sti_index, file.path("outputs", "04B_Phase4_STI_Ranks.csv"))
+
+
+raw_data_lodging <- raw_traits %>%
+  filter(Environment == "ABE", Treatment == "Dry") %>%
+  select(Genotype, ABE_Lodging = Lodging) %>%
+  distinct(Genotype, .keep_all = TRUE)
+
+stability_full <- env_ranks %>%
+  group_by(Genotype, Pedigree, Entry_type) %>%
+  summarise(
+    Envs_Tested = sum(!is.na(Env_Core_Rank)),
+    Pure_StayGreen_Mean_Rank = mean(Env_Core_Rank, na.rm = TRUE),
+    Mean_Rank = mean(Env_Core_Rank, na.rm = TRUE),
+    Rank_SD = sd(Env_Core_Rank, na.rm = TRUE),
+    Top_20_Freq = sum(Top_20_Pct, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(Envs_Tested == 3) %>%
+  left_join(raw_data_lodging, by = "Genotype") %>%
+  filter(!is.na(ABE_Lodging)) %>%
+  mutate(
+    Rank_Lodging = rank(ABE_Lodging, ties.method = "min", na.last = "keep"),
+    Ultimate_Pure_StayGreen_Rank = rank(Pure_StayGreen_Mean_Rank, ties.method = "min", na.last = "keep"),
+    Pure_StayGreen_Top10 = Ultimate_Pure_StayGreen_Rank <= 10,
+    Pure_StayGreen_Top20 = Ultimate_Pure_StayGreen_Rank <= ceiling(0.20 * n()),
+    Raw_Index_702010 =
+      (0.70 * as.numeric(scale(Mean_Rank))) +
+      (0.20 * as.numeric(scale(Rank_SD))) +
+      (0.10 * as.numeric(scale(Rank_Lodging))),
+    Selection_Index_702010 = Raw_Index_702010,
+    Final_Index_702010 = Raw_Index_702010,
+    Passed_Top20_Filter = Top_20_Freq > 0,
+    Eligibility_Status = ifelse(
+      Passed_Top20_Filter,
+      "Eligible: Top_20_Freq >= 1",
+      "Not eligible: Top_20_Freq = 0"
+    ),
+    Ultimate_Rank_702010_All = rank(Selection_Index_702010, ties.method = "min", na.last = "keep"),
+    Ultimate_Rank_702010 = rank(
+      ifelse(Passed_Top20_Filter, Selection_Index_702010, NA_real_),
+      ties.method = "min",
+      na.last = "keep"
+    ),
+    Ultimate_Rank_702010_Display = ifelse(
+      Passed_Top20_Filter,
+      as.character(Ultimate_Rank_702010),
+      "Not eligible"
+    )
+  ) %>%
+  arrange(Ultimate_Rank_702010) %>%
+  left_join(wide_env_ranks, by = "Genotype") %>%
+  left_join(flowering_summary_for_tables, by = c("Genotype", "Pedigree"))
+
+write_csv(stability_full, file.path("outputs", "04C_Phase4_Final_Selection_Index_702010.csv"))
+
+calc_weight_scenario <- function(df, perf_w, stab_w, lodg_w, scenario_label) {
+  index_col <- paste0("Index_", scenario_label)
+  rank_col <- paste0("Rank_", scenario_label)
+
+  out <- df %>%
+    mutate(
+      tmp_index =
+        perf_w * as.numeric(scale(Mean_Rank)) +
+        stab_w * as.numeric(scale(Rank_SD)) +
+        lodg_w * as.numeric(scale(Rank_Lodging)),
+      tmp_rank = rank(
+        ifelse(Passed_Top20_Filter, tmp_index, NA_real_),
+        ties.method = "min",
+        na.last = "keep"
+      )
+    ) %>%
+    select(Genotype, Pedigree, Top_20_Freq, tmp_index, tmp_rank)
+
+  names(out)[names(out) == "tmp_index"] <- index_col
+  names(out)[names(out) == "tmp_rank"] <- rank_col
+  out
+}
+
+s65 <- calc_weight_scenario(stability_full, 0.65, 0.25, 0.10, "65_25_10")
+s70 <- calc_weight_scenario(stability_full, 0.70, 0.20, 0.10, "70_20_10")
+s80 <- calc_weight_scenario(stability_full, 0.80, 0.10, 0.10, "80_10_10")
+
+weight_sensitivity <- s70 %>%
+  left_join(s65, by = c("Genotype", "Pedigree", "Top_20_Freq")) %>%
+  left_join(s80, by = c("Genotype", "Pedigree", "Top_20_Freq")) %>%
+  arrange(Rank_70_20_10)
+
+write_csv(weight_sensitivity, file.path("outputs", "04D_SGSI_Weight_Sensitivity.csv"))
+
+# ------------------------------------------------------------------------------
+# Supporting visual correlation and check performance outputs
+# ------------------------------------------------------------------------------
+if (all(c("Manual_AUC") %in% names(master_blups))) {
+  visual_correlations <- master_blups %>%
+    filter(Treatment == "Dry") %>%
+    select(Environment, Genotype, Manual_AUC, NDVI_AUC_Post, NDRE_AUC_Post, NDVI_Final, NDRE_Final) %>%
+    drop_na(Manual_AUC) %>%
+    pivot_longer(
+      cols = c(NDVI_AUC_Post, NDRE_AUC_Post, NDVI_Final, NDRE_Final),
+      names_to = "UAV_Trait",
+      values_to = "UAV_BLUP"
+    ) %>%
+    group_by(Environment, UAV_Trait) %>%
+    summarise(
+      n = n(),
+      Spearman_rho = safe_spearman(Manual_AUC, UAV_BLUP),
+      .groups = "drop"
+    )
+
+  write_csv(visual_correlations, file.path("outputs", "05A_UAV_vs_Visual_Correlations.csv"))
+}
+
+check_performance <- stability_full %>%
+  filter(grepl("check", Entry_type, ignore.case = TRUE)) %>%
+  select(
+    Genotype, Pedigree, Entry_type,
+    Mean_Rank, Rank_SD, Top_20_Freq,
+    ABE_Lodging, Rank_Lodging,
+    Final_Index_702010,
+    Ultimate_Rank_702010_All,
+    Ultimate_Rank_702010,
+    Ultimate_Rank_702010_Display,
+    CoreRank_ABE, CoreRank_BUSH, CoreRank_LBK
+  ) %>%
+  arrange(Ultimate_Rank_702010_All)
+
+write_csv(check_performance, file.path("outputs", "05B_Check_Variety_Performance.csv"))
+
+# ------------------------------------------------------------------------------
+# PCA and diversity-aware selected panel
+# ------------------------------------------------------------------------------
+pca_data_702010 <- dry_blups %>%
+  group_by(Genotype) %>%
+  summarise(
+    across(c(NDVI_AUC_Post, NDRE_AUC_Post, NDVI_Final, NDRE_Final), ~ mean(., na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  drop_na() %>%
+  inner_join(stability_full, by = "Genotype")
+
+pca_result_702010 <- prcomp(
+  pca_data_702010 %>% select(NDVI_AUC_Post, NDRE_AUC_Post, NDVI_Final, NDRE_Final),
+  center = TRUE,
+  scale. = TRUE
+)
+
+pca_var_702010 <- round(summary(pca_result_702010)$importance[2, ] * 100, 1)
+write_csv(
+  tibble(
+    PC = names(pca_var_702010),
+    Variance_Explained_Percent = as.numeric(pca_var_702010)
+  ),
+  file.path("outputs", "06D_PCA_Variance_Explained_702010.csv")
+)
+
+pca_data_702010$PC1 <- pca_result_702010$x[, 1]
+pca_data_702010$PC2 <- pca_result_702010$x[, 2]
+
+top_30_candidates <- pca_data_702010 %>%
+  filter(!is.na(Ultimate_Rank_702010) & Ultimate_Rank_702010 <= 30)
+
+set.seed(42)
+top_30_candidates$Diversity_Cluster <-
+  kmeans(top_30_candidates %>% select(PC1, PC2), centers = 10)$cluster
+
+diverse_top_10 <- top_30_candidates %>%
+  group_by(Diversity_Cluster) %>%
+  slice_min(Ultimate_Rank_702010, n = 1) %>%
+  ungroup() %>%
+  arrange(Ultimate_Rank_702010)
+
+write_csv(
+  pca_data_702010 %>%
+    select(
+      Genotype, Pedigree, Entry_type,
+      NDVI_AUC_Post, NDRE_AUC_Post, NDVI_Final, NDRE_Final,
+      PC1, PC2, Ultimate_Rank_702010, Ultimate_Pure_StayGreen_Rank,
+      Mean_Rank, Rank_SD, Top_20_Freq
+    ),
+  file.path("outputs", "06A_PCA_Scores_All_Genotypes_702010.csv")
+)
+
+write_csv(
+  top_30_candidates %>%
+    select(
+      Genotype, Pedigree, Entry_type, Diversity_Cluster, PC1, PC2,
+      Ultimate_Rank_702010, Ultimate_Pure_StayGreen_Rank,
+      Mean_Rank, Rank_SD, Top_20_Freq,
+      NDVI_AUC_Post, NDRE_AUC_Post, NDVI_Final, NDRE_Final
+    ) %>%
+    arrange(Ultimate_Rank_702010),
+  file.path("outputs", "06B_PCA_Scores_Top30_Candidate_Pool_702010.csv")
+)
+
+write_csv(
+  diverse_top_10 %>%
+    select(
+      Genotype, Pedigree, Entry_type, Diversity_Cluster, PC1, PC2,
+      Ultimate_Rank_702010, Ultimate_Pure_StayGreen_Rank,
+      Mean_Rank, Rank_SD, Top_20_Freq,
+      NDVI_AUC_Post, NDRE_AUC_Post, NDVI_Final, NDRE_Final
+    ),
+  file.path("outputs", "06C_Final_Diverse_Top10_Panel.csv")
+)
+
+
+# ------------------------------------------------------------------------------
+# MVP analysis from minimal Abernathy drought NDVI two-flight input
+# ------------------------------------------------------------------------------
+# The full-flight reference comes from the standard Phase 3 master BLUP file
+# generated above. The two-flight BLUP is recalculated from the minimal MVP input.
+
+mvp_input_file <- tryCatch(find_file("07A_MVP_ABE_Dry_NDVI_TwoFlight_Input.csv"), error = function(e) NA_character_)
+
+if (!is.na(mvp_input_file)) {
+  mvp_input <- read_csv(mvp_input_file, show_col_types = FALSE)
+
+  required_mvp_cols <- c(
+    "Environment", "Treatment", "Plot", "Genotype", "Pedigree",
+    "Block", "Row", "Column", "is_check", "GDD_to_Flowering",
+    "GDD_after_Flowering", "NDVI"
+  )
+  missing_mvp_cols <- setdiff(required_mvp_cols, names(mvp_input))
+  if (length(missing_mvp_cols) > 0) {
+    stop("MVP input file is missing required columns: ", paste(missing_mvp_cols, collapse = ", "))
+  }
+
+  two_flight_auc <- mvp_input %>%
+    filter(Environment == "ABE", Treatment == "Dry") %>%
+    group_by(Genotype, Pedigree, Plot, Block, Row, Column, is_check, GDD_to_Flowering) %>%
+    summarise(
+      AUC_2_Flight = calc_post_flowering_auc(GDD_after_Flowering, NDVI),
+      n_mvp_records = n(),
+      .groups = "drop"
+    ) %>%
+    filter(is.finite(AUC_2_Flight), !is.na(Genotype), n_mvp_records >= 2)
+
+  if (nrow(two_flight_auc) >= 20) {
+    df_fit <- two_flight_auc %>%
+      mutate(
+        geno = as.factor(Genotype),
+        RowID = as.numeric(as.factor(Row)),
+        ColID = as.numeric(as.factor(Column)),
+        CheckType = factor(
+          case_when(
+            is_check == "primary" ~ "Primary",
+            is_check == "secondary" ~ "Secondary",
+            TRUE ~ "Entry"
+          ),
+          levels = c("Entry", "Primary", "Secondary")
+        ),
+        GDD_Covariate = as.numeric(scale(GDD_to_Flowering))
+      )
+
+    nseg_r <- max(2, min(4, length(unique(df_fit$RowID)) - 1))
+    nseg_c <- max(2, min(4, length(unique(df_fit$ColID)) - 1))
+
+    mvp_fit <- tryCatch({
+      SpATS(
+        response = "AUC_2_Flight",
+        spatial = ~ PSANOVA(RowID, ColID, nseg = c(nseg_r, nseg_c)),
+        genotype = "geno",
+        genotype.as.random = TRUE,
+        fixed = ~ GDD_Covariate + CheckType,
+        data = df_fit,
+        control = list(tolerance = 1e-06, monitoring = 0)
+      )
+    }, error = function(e) NULL)
+
+    if (is.null(mvp_fit)) {
+      mvp_pred <- df_fit %>%
+        group_by(geno) %>%
+        summarise(AUC_2_Flight_BLUP = mean(AUC_2_Flight, na.rm = TRUE), .groups = "drop") %>%
+        rename(Genotype = geno)
+    } else {
+      mvp_pred <- as.data.frame(predict(mvp_fit, which = "geno")) %>%
+        distinct(geno, .keep_all = TRUE) %>%
+        select(Genotype = geno, AUC_2_Flight_BLUP = predicted.values)
+    }
+
+    mvp_comparison <- master_blups %>%
+      filter(Environment == "ABE", Treatment == "Dry") %>%
+      select(Genotype, Pedigree, AUC_Full_BLUP = NDVI_AUC_Post) %>%
+      inner_join(mvp_pred, by = "Genotype") %>%
+      mutate(
+        Rank_Full_Flight = rank(desc(AUC_Full_BLUP), ties.method = "min", na.last = "keep"),
+        Rank_2_Flight = rank(desc(AUC_2_Flight_BLUP), ties.method = "min", na.last = "keep")
+      ) %>%
+      drop_na()
+
+    write_csv(mvp_comparison, file.path("outputs", "07B_MVP_ABE_Dry_Comparison_Output.csv"))
+    cat("Done: MVP comparison saved to outputs/07B_MVP_ABE_Dry_Comparison_Output.csv\n")
+  } else {
+    message("Skipping MVP: fewer than 20 plots had two usable MVP NDVI records.")
+  }
+} else {
+  message("Skipping MVP: 07A_MVP_ABE_Dry_NDVI_TwoFlight_Input.csv was not found.")
+}
+
+cat("Done: manuscript analysis outputs saved in ./outputs\n")
+cat("Note: 03B descriptive stats are Dry-only and limited to NDVI/NDRE AUC and final traits.\n")
+cat("Note: MVP is regenerated only when 07A_MVP_ABE_Dry_NDVI_TwoFlight_Input.csv is available.\n")
+
+
+
