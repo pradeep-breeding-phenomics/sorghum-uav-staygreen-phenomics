@@ -1,7 +1,18 @@
 # ==============================================================================
 # Reproduce manuscript analysis
-# UAV sorghum stay-green phenomics 
-# ============================================================================== 
+# UAV sorghum stay-green phenomics
+#
+# Input : data/02_Phase2_Extracted_Traits.csv (plot-level traits)
+#         data/07A_MVP_ABE_Dry_NDVI_TwoFlight_Input.csv (optional, two-flight MVP)
+# Output: tables written to ./outputs (03A-08C; see README)
+# Run from the repository root. Tested with R 4.5.1 and SpATS 1.0.19.
+#
+# Workflow:
+#   Phase 3  SpATS spatial models -> genotype BLUPs, descriptive stats, reliability
+#   Phase 4  environment ranks, STI, SGSI (70:20:10), weight sensitivity
+#   Then     visual-score correlations, check benchmarking, PCA + K-means panel,
+#            two-flight MVP comparisonb  and STI robustness checks
+# ==============================================================================
 
 rm(list = ls())
 
@@ -20,6 +31,7 @@ library(SpATS)
 dir.create("outputs", showWarnings = FALSE)
 
 
+# Look for an input file in ./data, ./outputs, or the working directory
 find_file <- function(filename) {
   candidates <- c(
     file.path("data", filename),
@@ -36,6 +48,7 @@ find_file <- function(filename) {
   hit[1]
 }
 
+# Spearman correlation that returns NA when fewer than 3 complete pairs exist
 safe_spearman <- function(x, y) {
   ok <- complete.cases(x, y)
   if (sum(ok) < 3) return(NA_real_)
@@ -79,6 +92,10 @@ if (length(missing_cols) > 0) {
 
 # ------------------------------------------------------------------------------
 # SpATS function for UAV/visual traits
+# Model: PSANOVA row-column surface + fixed GDD covariate and check type
+#        + random block (when >1 block) + random genotype.
+# Returns genotype BLUPs and raw-plot descriptive statistics (mean, range, CV)
+# plus reliability. The script stops if a model fails to fit.
 # ------------------------------------------------------------------------------
 run_spats_and_stats <- function(data, trait_name) {
   df_fit <- data %>%
@@ -141,25 +158,27 @@ run_spats_and_stats <- function(data, trait_name) {
         control = list(tolerance = 1e-06, monitoring = 0)
       )
     }
-  }, error = function(e) NULL)
-
-  if (is.null(fit)) {
-    pred <- df_fit %>%
-      group_by(geno) %>%
-      summarise(!!trait_name := mean(.data[[trait_name]], na.rm = TRUE), .groups = "drop")
-    basic_stats$Repeatability <- NA_real_
-    return(list(blups = pred, stats = basic_stats))
-  }
+  }, error = function(e) {
+    stop(
+      "SpATS failed for ", trait_name,
+      " (", unique(data$Environment), " ",
+      unique(data$Treatment), "): ",
+      conditionMessage(e),
+      call. = FALSE
+    )
+  })
 
   pred <- as.data.frame(predict(fit, which = "geno")) %>%
     distinct(geno, .keep_all = TRUE) %>%
     select(geno, predicted.values) %>%
     rename(!!trait_name := predicted.values)
 
-  basic_stats$Repeatability <- tryCatch(getHeritability(fit), error = function(e) NA_real_)
+  # Reliability (R): SpATS generalized heritability (Oakey et al., 2006)
+  basic_stats$Reliability <- tryCatch(getHeritability(fit), error = function(e) NA_real_)
   list(blups = pred, stats = basic_stats)
 }
 
+# Fit models for every environment x treatment x trait combination
 # Core traits used in manuscript SGSI analysis
 core_traits <- c("NDVI_AUC_Post", "NDRE_AUC_Post", "NDVI_Final", "NDRE_Final")
 
@@ -222,12 +241,16 @@ master_blups <- bind_rows(final_blups_list) %>%
 # Descriptive stats for four core manuscript traits only.
 stats_table <- bind_rows(final_stats_list) %>%
   filter(Treatment == "Dry", Trait %in% core_traits) %>%
-  select(Environment, Treatment, Trait, N_Plots, Mean, Median, Min, Max, CV_Percent, Repeatability) %>%
+  select(Environment, Treatment, Trait, N_Plots, Mean, Median, Min, Max, CV_Percent, Reliability) %>%
   arrange(Environment, Trait)
 
 write_csv(stats_table, file.path("outputs", "03B_Phase3_Descriptive_Stats.csv"))
 
 
+# ------------------------------------------------------------------------------
+# Flowering-time BLUPs (days and GDD to 50% anthesis); same spatial model
+# without the GDD covariate. Used only for flowering columns in 04C.
+# ------------------------------------------------------------------------------
 run_spats_flowering <- function(data, trait_name) {
   df_fit <- data %>%
     filter(is.finite(.data[[trait_name]]), !is.na(Genotype)) %>%
@@ -275,17 +298,14 @@ run_spats_flowering <- function(data, trait_name) {
         control = list(tolerance = 1e-06, monitoring = 0)
       )
     }
-  }, error = function(e) NULL)
+  }, error = function(e) {
+    stop("SpATS failed for ", trait_name, " (", unique(data$Environment), " ",
+         unique(data$Treatment), "): ", conditionMessage(e), call. = FALSE)
+  })
 
-  if (is.null(fit)) {
-    df_fit %>%
-      group_by(geno) %>%
-      summarise(predicted.values = mean(.data[[trait_name]], na.rm = TRUE), .groups = "drop")
-  } else {
-    as.data.frame(predict(fit, which = "geno")) %>%
-      distinct(geno, .keep_all = TRUE) %>%
-      select(geno, predicted.values)
-  }
+  as.data.frame(predict(fit, which = "geno")) %>%
+    distinct(geno, .keep_all = TRUE) %>%
+    select(geno, predicted.values)
 }
 
 flowering_blups_list <- list()
@@ -340,6 +360,10 @@ flowering_summary_for_tables <- master_blups %>%
 dry_blups <- master_blups %>% filter(Treatment == "Dry")
 irr_blups <- master_blups %>% filter(Treatment == "Irr")
 
+# Environment-specific ranks (drought only). Each core trait is ranked
+# (higher value = better rank), the four ranks are averaged, and the average is
+# re-ranked to give Env_Core_Rank. Top 20% = rank <= 0.20 x number of genotypes
+# ranked in that environment (N = 150, 173, 188 -> T = 30, 34, 37).
 env_ranks <- dry_blups %>%
   group_by(Environment) %>%
   mutate(
@@ -349,9 +373,14 @@ env_ranks <- dry_blups %>%
     Rank_NDRE_Fin = rank(desc(NDRE_Final), ties.method = "min", na.last = "keep"),
     Avg_Core_Rank = (Rank_NDVI_AUC + Rank_NDRE_AUC + Rank_NDVI_Fin + Rank_NDRE_Fin) / 4,
     Env_Core_Rank = rank(Avg_Core_Rank, ties.method = "min", na.last = "keep"),
-    Top_20_Pct = ifelse(Env_Core_Rank <= (n() * 0.20), 1, 0)
+    N_Ranked = sum(!is.na(Env_Core_Rank)),
+    Top_20_Pct = ifelse(Env_Core_Rank <= 0.20 * N_Ranked, 1, 0)
   ) %>%
   ungroup()
+
+print(env_ranks %>% group_by(Environment) %>%
+  summarise(N_Ranked = first(N_Ranked), Top20_n = sum(Top_20_Pct, na.rm = TRUE)))
+# expect N_Ranked = 150, 173, 188
 
 wide_env_ranks <- env_ranks %>%
   select(Genotype, Environment, Env_Core_Rank) %>%
@@ -359,6 +388,9 @@ wide_env_ranks <- env_ranks %>%
 
 write_csv(env_ranks, file.path("outputs", "04A_Phase4_Environment_Ranks.csv"))
 
+# Stress tolerance index (Fernandez, 1992) on BLUPs, per trait and environment:
+# STI = (drought x irrigated) / mean(irrigated)^2. Traits are ranked, ranks
+# averaged within environment, then averaged across ABE and BUSH.
 sti_calc <- dry_blups %>%
   filter(Environment %in% c("ABE", "BUSH")) %>%
   select(
@@ -411,11 +443,17 @@ final_sti_index <- sti_calc %>%
 write_csv(final_sti_index, file.path("outputs", "04B_Phase4_STI_Ranks.csv"))
 
 
+# Lodging score (ABE drought) used as the agronomic penalty in the SGSI
 raw_data_lodging <- raw_traits %>%
   filter(Environment == "ABE", Treatment == "Dry") %>%
   select(Genotype, ABE_Lodging = Lodging) %>%
   distinct(Genotype, .keep_all = TRUE)
 
+# SGSI: genotypes ranked in all three environments with a lodging record
+# (139 = 133 SAP accessions + 6 checks).
+# SGSI = 0.70 z(mean rank) + 0.20 z(rank SD) + 0.10 z(lodging rank); lower = better.
+# Eligible = top 20% in at least one environment; Ultimate_Rank_702010 ranks
+# eligible genotypes only, Ultimate_Rank_702010_All ranks all 139.
 stability_full <- env_ranks %>%
   group_by(Genotype, Pedigree, Entry_type) %>%
   summarise(
@@ -464,6 +502,7 @@ stability_full <- env_ranks %>%
 
 write_csv(stability_full, file.path("outputs", "04C_Phase4_Final_Selection_Index_702010.csv"))
 
+# Weight sensitivity: recompute the SGSI under alternative weights
 calc_weight_scenario <- function(df, perf_w, stab_w, lodg_w, scenario_label) {
   index_col <- paste0("Index_", scenario_label)
   rank_col <- paste0("Rank_", scenario_label)
@@ -540,6 +579,9 @@ write_csv(check_performance, file.path("outputs", "05B_Check_Variety_Performance
 # ------------------------------------------------------------------------------
 # PCA and diversity-aware selected panel
 # ------------------------------------------------------------------------------
+# PCA on cross-environment mean BLUPs of the four core traits (139 genotypes);
+# K-means (k = 10) on PC1/PC2 of the top 30 eligible genotypes; the best-ranked
+# genotype in each cluster forms the diversity-aware panel.
 pca_data_702010 <- dry_blups %>%
   group_by(Genotype) %>%
   summarise(
@@ -652,6 +694,7 @@ if (!is.na(mvp_input_file)) {
         geno = as.factor(Genotype),
         RowID = as.numeric(as.factor(Row)),
         ColID = as.numeric(as.factor(Column)),
+        BlockID = as.factor(Block),
         CheckType = factor(
           case_when(
             is_check == "primary" ~ "Primary",
@@ -666,29 +709,66 @@ if (!is.na(mvp_input_file)) {
     nseg_r <- max(2, min(4, length(unique(df_fit$RowID)) - 1))
     nseg_c <- max(2, min(4, length(unique(df_fit$ColID)) - 1))
 
+
+    # Check whether the random block effect can be fitted
+    has_blocks <- n_distinct(df_fit$BlockID, na.rm = TRUE) > 1
+    
+    # Fit the same spatial model structure as the main analysis
     mvp_fit <- tryCatch({
-      SpATS(
-        response = "AUC_2_Flight",
-        spatial = ~ PSANOVA(RowID, ColID, nseg = c(nseg_r, nseg_c)),
-        genotype = "geno",
-        genotype.as.random = TRUE,
-        fixed = ~ GDD_Covariate + CheckType,
-        data = df_fit,
-        control = list(tolerance = 1e-06, monitoring = 0)
+      
+      if (has_blocks) {
+        SpATS(
+          response = "AUC_2_Flight",
+          spatial = ~ PSANOVA(
+            RowID, ColID,
+            nseg = c(nseg_r, nseg_c)
+          ),
+          genotype = "geno",
+          genotype.as.random = TRUE,
+          fixed = ~ GDD_Covariate + CheckType,
+          random = ~ BlockID,
+          data = df_fit,
+          control = list(
+            tolerance = 1e-06,
+            monitoring = 0
+          )
+        )
+      } else {
+        SpATS(
+          response = "AUC_2_Flight",
+          spatial = ~ PSANOVA(
+            RowID, ColID,
+            nseg = c(nseg_r, nseg_c)
+          ),
+          genotype = "geno",
+          genotype.as.random = TRUE,
+          fixed = ~ GDD_Covariate + CheckType,
+          data = df_fit,
+          control = list(
+            tolerance = 1e-06,
+            monitoring = 0
+          )
+        )
+      }
+      
+    }, error = function(e) {
+      stop(
+        "MVP SpATS model failed: ",
+        conditionMessage(e),
+        call. = FALSE
       )
-    }, error = function(e) NULL)
-
-    if (is.null(mvp_fit)) {
-      mvp_pred <- df_fit %>%
-        group_by(geno) %>%
-        summarise(AUC_2_Flight_BLUP = mean(AUC_2_Flight, na.rm = TRUE), .groups = "drop") %>%
-        rename(Genotype = geno)
-    } else {
-      mvp_pred <- as.data.frame(predict(mvp_fit, which = "geno")) %>%
-        distinct(geno, .keep_all = TRUE) %>%
-        select(Genotype = geno, AUC_2_Flight_BLUP = predicted.values)
-    }
-
+    })
+    
+    # Extract actual SpATS predictions only
+    mvp_pred <- as.data.frame(
+      predict(mvp_fit, which = "geno")
+    ) %>%
+      distinct(geno, .keep_all = TRUE) %>%
+      select(
+        Genotype = geno,
+        AUC_2_Flight_BLUP = predicted.values
+      )
+    
     mvp_comparison <- master_blups %>%
       filter(Environment == "ABE", Treatment == "Dry") %>%
       select(Genotype, Pedigree, AUC_Full_BLUP = NDVI_AUC_Post) %>%
@@ -707,6 +787,102 @@ if (!is.na(mvp_input_file)) {
 } else {
   message("Skipping MVP: 07A_MVP_ABE_Dry_NDVI_TwoFlight_Input.csv was not found.")
 }
+
+# ------------------------------------------------------------------------------
+# Supplementary Table S7: common-set (139 genotypes) SGSI robustness check
+# Genotypes in 04C (complete data in all three environments) are re-ranked within
+# that common set in each environment; SGSI is recomputed with the same
+# 70:20:10 weights, lodging rank and top-20% eligibility rule.
+# ------------------------------------------------------------------------------
+z <- function(x) as.numeric(scale(x))
+s7_ranks <- env_ranks %>%
+  filter(Genotype %in% stability_full$Genotype) %>%
+  group_by(Environment) %>%
+  mutate(
+    Common_Core_Rank = rank(
+      (rank(desc(NDVI_AUC_Post), ties.method = "min") +
+       rank(desc(NDRE_AUC_Post), ties.method = "min") +
+       rank(desc(NDVI_Final),    ties.method = "min") +
+       rank(desc(NDRE_Final),    ties.method = "min")) / 4,
+      ties.method = "min"),
+    Common_Top20 = as.integer(Common_Core_Rank <= 0.20 * n())
+  ) %>%
+  ungroup()
+stopifnot(nrow(s7_ranks) == 3 * nrow(stability_full))
+
+s7 <- stability_full %>%
+  inner_join(
+    s7_ranks %>% group_by(Genotype) %>%
+      summarise(Common_Mean_Rank  = mean(Common_Core_Rank),
+                Common_Rank_SD    = sd(Common_Core_Rank),
+                Common_Top20_Freq = sum(Common_Top20), .groups = "drop"),
+    by = "Genotype") %>%
+  mutate(
+    Common_Rank_Lodging = rank(ABE_Lodging, ties.method = "min"),
+    Common_SGSI = 0.70 * z(Common_Mean_Rank) + 0.20 * z(Common_Rank_SD) +
+                  0.10 * z(Common_Rank_Lodging),
+    Common_Eligible = Common_Top20_Freq > 0,
+    Common_SGSI_Rank_All = rank(Common_SGSI, ties.method = "min"),
+    Common_SGSI_Rank_Eligible = rank(ifelse(Common_Eligible, Common_SGSI, NA_real_),
+                                     ties.method = "min", na.last = "keep")
+  )
+
+s7_cor <- tibble(
+  Comparison = c("Full SGSI - All", "Full SGSI - Eligible in both", "Mean Core Rank - All"),
+  N = c(nrow(s7), sum(!is.na(s7$Ultimate_Rank_702010) & !is.na(s7$Common_SGSI_Rank_Eligible)), nrow(s7)),
+  Spearman_rho = c(
+    safe_spearman(s7$Ultimate_Rank_702010_All, s7$Common_SGSI_Rank_All),
+    safe_spearman(s7$Ultimate_Rank_702010, s7$Common_SGSI_Rank_Eligible),
+    safe_spearman(s7$Mean_Rank, s7$Common_Mean_Rank))
+)
+print(s7_cor)
+cat("Top 20% in all 3 (original):", s7$Pedigree[s7$Top_20_Freq == 3], "\n")
+cat("Top 20% in all 3 (common):  ", s7$Pedigree[s7$Common_Top20_Freq == 3], "\n")
+
+write_csv(
+  s7 %>% select(Genotype, Pedigree, Entry_type, ABE_Lodging, Rank_Lodging, Common_Rank_Lodging,
+                Mean_Rank, Common_Mean_Rank, Rank_SD, Common_Rank_SD,
+                Top_20_Freq, Common_Top20_Freq, Selection_Index_702010, Common_SGSI,
+                Ultimate_Rank_702010_All, Common_SGSI_Rank_All,
+                Ultimate_Rank_702010, Common_SGSI_Rank_Eligible, Common_Eligible),
+  file.path("outputs", "08A_S7_Full_SGSI_Comparison.csv"))
+write_csv(s7_cor, file.path("outputs", "08B_S7_SGSI_Correlations.csv"))
+write_csv(
+  s7_ranks %>% select(Genotype, Pedigree, Environment, Env_Core_Rank, Common_Core_Rank,
+                      Top_20_Pct, Common_Top20),
+  file.path("outputs", "08C_S7_Environment_Ranks.csv"))
+
+# ------------------------------------------------------------------------------
+# STI robustness check: only genotypes with paired data at BOTH ABE and BUSH
+# ------------------------------------------------------------------------------
+sti_both <- sti_calc %>%
+  filter(!is.na(Env_STI_Rank)) %>%
+  group_by(Genotype) %>% filter(n_distinct(Environment) == 2) %>% ungroup() %>%
+  group_by(Environment) %>%
+  mutate(
+    s1 = (D_NDVI_A * I_NDVI_A) / mean(I_NDVI_A, na.rm = TRUE)^2,
+    s2 = (D_NDRE_A * I_NDRE_A) / mean(I_NDRE_A, na.rm = TRUE)^2,
+    s3 = (D_NDVI_F * I_NDVI_F) / mean(I_NDVI_F, na.rm = TRUE)^2,
+    s4 = (D_NDRE_F * I_NDRE_F) / mean(I_NDRE_F, na.rm = TRUE)^2,
+    r = rank(rowMeans(cbind(
+          rank(desc(s1), ties.method = "min", na.last = "keep"),
+          rank(desc(s2), ties.method = "min", na.last = "keep"),
+          rank(desc(s3), ties.method = "min", na.last = "keep"),
+          rank(desc(s4), ties.method = "min", na.last = "keep")), na.rm = TRUE),
+        ties.method = "min")
+  ) %>% ungroup() %>%
+  group_by(Genotype) %>% summarise(Mean_STI_Rank_2env = mean(r), .groups = "drop") %>%
+  mutate(STI_Rank_2env = rank(Mean_STI_Rank_2env, ties.method = "min"),
+         STI_Top20_2env = STI_Rank_2env <= 0.20 * n()) %>%
+  left_join(pedigree_map, by = "Genotype")
+
+sti_chk <- stability_full %>%
+  filter(!is.na(Ultimate_Rank_702010), Ultimate_Rank_702010 <= 12) %>%
+  select(Genotype, Pedigree, Ultimate_Rank_702010) %>%
+  left_join(sti_both %>% select(-Pedigree), by = "Genotype")
+cat("STI two-environment check: n =", nrow(sti_both),
+    "| SGSI top 12 also in STI top 20%:", sum(sti_chk$STI_Top20_2env, na.rm = TRUE), "of 12\n")
+write_csv(sti_both, file.path("outputs", "04E_STI_Ranks_TwoEnv_Check.csv"))
 
 cat("Done: manuscript analysis outputs saved in ./outputs\n")
 cat("Note: 03B descriptive stats are Dry-only and limited to NDVI/NDRE AUC and final traits.\n")
